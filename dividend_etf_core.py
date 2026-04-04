@@ -412,3 +412,102 @@ def run_backtest(
         "total_trades": len(closed_trades),
         "win_rate": round(win_rate, 2),
     }
+
+
+# ─────────────────────────────────────────────
+# 主程序入口
+# ─────────────────────────────────────────────
+
+def main():
+    from feishu_push_service import format_report, push_to_feishu
+
+    # 1. 加载配置
+    config = load_config()
+    today_str = datetime.today().strftime("%Y%m%d")
+
+    # 2. 交易日检查
+    if not is_trade_day(today_str, config):
+        logger.info(f"[SKIP] 今日 {today_str} 非交易日，程序退出")
+        return
+
+    logger.info(f"[START] 今日 {today_str} 开始运行红利ETF监控")
+
+    # 3. ETF 筛选
+    etf_list = screen_dividend_etfs(config)
+    if etf_list.empty:
+        logger.warning("筛选后无红利ETF标的，程序退出")
+        return
+
+    total_count = len(etf_list)
+    logger.info(f"筛选到红利ETF {total_count} 只，开始逐只分析...")
+
+    buy_list, hold_list, sell_list = [], [], []
+
+    for _, row in etf_list.iterrows():
+        ts_code = row["ts_code"]
+        name = row["name"]
+        logger.info(f"  分析：{ts_code} {name}")
+
+        try:
+            # 4. 获取数据
+            daily_df = fetch_8year_daily(ts_code, config)
+            if daily_df.empty or len(daily_df) < 100:
+                logger.warning(f"  {ts_code} 数据不足，跳过")
+                continue
+
+            div_df = fetch_12month_div(ts_code, config)
+
+            # 5. 计算指标
+            current_price = float(daily_df.iloc[-1]["close"])
+            rsi = calculate_weekly_rsi(daily_df)
+            yield_pct = calculate_ttm_yield(ts_code, current_price, div_df)
+
+            if rsi is None:
+                logger.warning(f"  {ts_code} RSI 计算失败（数据不足），跳过")
+                continue
+
+            # 6. 生成信号
+            signal = generate_signal(rsi, yield_pct)
+
+            # 7. 回测（仅买入标的计算回测）
+            backtest_result = {"annualized_return": 0.0, "max_drawdown": 0.0, "total_trades": 0, "win_rate": 0.0}
+            if signal == "BUY":
+                backtest_result = run_backtest(ts_code, daily_df, div_df)
+
+            etf_result = {
+                "ts_code": ts_code,
+                "name": name,
+                "rsi": rsi,
+                "yield_pct": yield_pct,
+                "signal": signal,
+                "backtest": backtest_result,
+            }
+
+            if signal == "BUY":
+                buy_list.append(etf_result)
+            elif signal.startswith("SELL"):
+                sell_list.append(etf_result)
+            else:
+                hold_list.append(etf_result)
+
+        except Exception as e:
+            logger.error(f"  处理 {ts_code} 时发生异常：{e}")
+            continue
+
+    # 多只买入信号时，仅保留股息率最高者（其余降为持有）
+    if len(buy_list) > 1:
+        buy_list.sort(key=lambda x: x["yield_pct"], reverse=True)
+        logger.info(f"多只买入信号，选择股息率最高：{buy_list[0]['ts_code']} {buy_list[0]['yield_pct']:.2f}%")
+        hold_list.extend(buy_list[1:])
+        buy_list = [buy_list[0]]
+
+    # 8. 飞书推送
+    date_display = datetime.today().strftime("%Y-%m-%d")
+    report = format_report(date_display, buy_list, hold_list, sell_list, total_count)
+    push_to_feishu(config["feishu_url"], report)
+
+    logger.info(f"[DONE] 完成：买入{len(buy_list)}只，持有{len(hold_list)}只，卖出{len(sell_list)}只")
+
+
+if __name__ == "__main__":
+    main()
