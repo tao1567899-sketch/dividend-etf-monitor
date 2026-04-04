@@ -230,3 +230,34 @@ def calculate_ttm_yield(ts_code: str, current_price: float, div_df: pd.DataFrame
 
     total_div = pd.to_numeric(code_div["div_cash"], errors="coerce").fillna(0).sum()
     return round(total_div / current_price * 100, 4)
+
+
+# ─────────────────────────────────────────────
+# 交易信号生成
+# ─────────────────────────────────────────────
+
+# 策略阈值
+RSI_BUY_THRESHOLD = 40.0
+RSI_SELL_THRESHOLD = 70.0
+YIELD_BUY_THRESHOLD = 4.0    # %
+YIELD_SELL_THRESHOLD = 3.0   # %
+
+
+def generate_signal(rsi: float, yield_pct: float) -> str:
+    """
+    根据周线 RSI 和 TTM 股息率生成交易信号。
+    返回值：'BUY' | 'SELL_RSI' | 'SELL_YIELD' | 'HOLD'
+
+    注：止损条件（买入成本×0.85）仅在回测中追踪，每日信号不含止损判断。
+    """
+    # 卖出条件优先（RSI 超买优先于股息率过低）
+    if rsi >= RSI_SELL_THRESHOLD:
+        return "SELL_RSI"
+    if yield_pct <= YIELD_SELL_THRESHOLD and yield_pct > 0:
+        return "SELL_YIELD"
+
+    # 买入条件（需同时满足）
+    if rsi <= RSI_BUY_THRESHOLD and yield_pct >= YIELD_BUY_THRESHOLD:
+        return "BUY"
+
+    return "HOLD"
