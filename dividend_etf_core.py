@@ -92,3 +92,71 @@ def is_trade_day(date_str: str, config: dict) -> bool:
     if df.empty:
         return False
     return int(df.iloc[0]["is_open"]) == 1
+
+
+# ─────────────────────────────────────────────
+# ETF 筛选
+# ─────────────────────────────────────────────
+
+DIVIDEND_KEYWORDS = ["红利", "股息", "高息", "红利低波", "央企红利"]
+MIN_LIST_MONTHS = 6
+MIN_AVG_AMOUNT = 500_000  # 测试数据单位一致：日均成交额阈值
+
+
+def screen_dividend_etfs(config: dict) -> pd.DataFrame:
+    """
+    筛选全市场符合条件的红利ETF。
+    返回包含 ts_code, name 列的 DataFrame。
+    """
+    # 1. 获取全市场 ETF 基础信息
+    df = tushare_call(
+        "fund_basic",
+        params={"market": "E", "status": "L"},
+        fields="ts_code,name,fund_type,market,list_date",
+        config=config,
+    )
+
+    # 2. 关键词过滤
+    keyword_mask = df["name"].apply(
+        lambda n: any(kw in str(n) for kw in DIVIDEND_KEYWORDS)
+    )
+    df = df[keyword_mask].copy()
+
+    # 3. 上市时间过滤（≥6个月）
+    cutoff = (datetime.today() - timedelta(days=MIN_LIST_MONTHS * 30)).strftime("%Y%m%d")
+    df = df[df["list_date"] <= cutoff].copy()
+
+    if df.empty:
+        logger.warning("关键词+上市时间过滤后无标的")
+        return df
+
+    # 4. 流动性过滤：近20交易日日均成交额 ≥ 阈值
+    end_date = datetime.today().strftime("%Y%m%d")
+    start_date = (datetime.today() - timedelta(days=40)).strftime("%Y%m%d")
+    codes = ",".join(df["ts_code"].tolist())
+
+    daily_df = tushare_call(
+        "fund_daily",
+        params={"ts_code": codes, "start_date": start_date, "end_date": end_date},
+        fields="ts_code,trade_date,amount",
+        config=config,
+    )
+
+    if daily_df.empty:
+        logger.warning("流动性数据获取为空，跳过流动性过滤")
+        return df
+
+    daily_df["amount"] = pd.to_numeric(daily_df["amount"], errors="coerce").fillna(0)
+    avg_amount = (
+        daily_df.groupby("ts_code")["amount"]
+        .apply(lambda x: x.nlargest(20).mean())
+        .reset_index()
+        .rename(columns={"amount": "avg_amount"})
+    )
+
+    df = df.merge(avg_amount, on="ts_code", how="left")
+    df["avg_amount"] = df["avg_amount"].fillna(0)
+    df = df[df["avg_amount"] >= MIN_AVG_AMOUNT].copy()
+
+    logger.info(f"筛选后红利ETF共 {len(df)} 只")
+    return df[["ts_code", "name"]].reset_index(drop=True)
