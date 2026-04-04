@@ -82,3 +82,45 @@ def test_calculate_weekly_rsi_insufficient_data():
     prices = pd.Series(range(1, 31), index=dates, dtype=float)
     df = pd.DataFrame({"trade_date": dates.strftime("%Y%m%d"), "close": prices.values})
     assert calculate_weekly_rsi(df) is None
+
+
+def test_calculate_ttm_yield_normal():
+    """近12个月有两次分红，股息率应等于合计分红/当前价格"""
+    from dividend_etf_core import calculate_ttm_yield
+
+    today = datetime.today()
+    six_months_ago = (today - timedelta(days=180)).strftime("%Y%m%d")
+    ten_months_ago = (today - timedelta(days=300)).strftime("%Y%m%d")
+    fifteen_months_ago = (today - timedelta(days=450)).strftime("%Y%m%d")
+
+    div_df = pd.DataFrame({
+        "ts_code":  ["512890.SH", "512890.SH", "512890.SH"],
+        "ex_date":  [six_months_ago, ten_months_ago, fifteen_months_ago],
+        "div_cash": [0.12, 0.10, 0.08],  # 15个月前的不应计入
+    })
+
+    # 当前价格 5.50，12个月内分红 0.12+0.10=0.22
+    # 股息率 = 0.22/5.50 * 100 = 4.0%
+    yield_pct = calculate_ttm_yield("512890.SH", current_price=5.50, div_df=div_df)
+    assert abs(yield_pct - 4.0) < 0.01, f"期望股息率4.0%，实际{yield_pct:.4f}%"
+
+
+def test_calculate_ttm_yield_no_dividend():
+    """近12个月无分红时股息率为 0"""
+    from dividend_etf_core import calculate_ttm_yield
+
+    div_df = pd.DataFrame({"ts_code": [], "ex_date": [], "div_cash": []})
+    assert calculate_ttm_yield("512890.SH", current_price=5.0, div_df=div_df) == 0.0
+
+
+def test_calculate_ttm_yield_zero_price():
+    """价格为0时返回 0，不报错"""
+    from dividend_etf_core import calculate_ttm_yield
+
+    today = datetime.today()
+    div_df = pd.DataFrame({
+        "ts_code": ["512890.SH"],
+        "ex_date": [(today - timedelta(days=30)).strftime("%Y%m%d")],
+        "div_cash": [0.10],
+    })
+    assert calculate_ttm_yield("512890.SH", current_price=0.0, div_df=div_df) == 0.0

@@ -200,3 +200,33 @@ def calculate_weekly_rsi(daily_df: pd.DataFrame, period: int = 14):
 
     last_rsi = rsi.iloc[-1]
     return round(float(last_rsi), 2) if not np.isnan(last_rsi) else None
+
+
+# ─────────────────────────────────────────────
+# TTM 股息率计算
+# ─────────────────────────────────────────────
+
+def calculate_ttm_yield(ts_code: str, current_price: float, div_df: pd.DataFrame) -> float:
+    """
+    计算 TTM（近12个月）股息率。
+    - div_df 需包含 ts_code, ex_date(YYYYMMDD str), div_cash 列
+    - 返回百分比形式（如 4.0 表示 4.0%）
+    - 无分红或价格为0时返回 0.0
+    """
+    if current_price <= 0:
+        return 0.0
+
+    if div_df.empty:
+        return 0.0
+
+    cutoff = (datetime.today() - timedelta(days=365)).strftime("%Y%m%d")
+    code_div = div_df[
+        (div_df["ts_code"].astype(str) == ts_code) &
+        (div_df["ex_date"].astype(str) >= cutoff)
+    ]
+
+    if code_div.empty:
+        return 0.0
+
+    total_div = pd.to_numeric(code_div["div_cash"], errors="coerce").fillna(0).sum()
+    return round(total_div / current_price * 100, 4)
