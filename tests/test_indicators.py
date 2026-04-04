@@ -28,3 +28,25 @@ def test_load_config_success(monkeypatch):
     assert cfg["token"] == "test_token"
     assert cfg["api_url"] == "http://proxy.example.com"
     assert cfg["feishu_url"] == "http://feishu.example.com/hook"
+
+
+def test_is_trade_day_true(mocker):
+    """当日在交易日历中标记为交易日时返回 True"""
+    mock_df = pd.DataFrame({
+        "cal_date": ["20260404"],
+        "is_open": [1]
+    })
+    mocker.patch("dividend_etf_core.tushare_call", return_value=mock_df)
+    from dividend_etf_core import is_trade_day
+    assert is_trade_day("20260404", config={"token": "t", "api_url": "u", "feishu_url": "f"}) is True
+
+
+def test_is_trade_day_false(mocker):
+    """当日在交易日历中标记为非交易日时返回 False"""
+    mock_df = pd.DataFrame({
+        "cal_date": ["20260405"],
+        "is_open": [0]
+    })
+    mocker.patch("dividend_etf_core.tushare_call", return_value=mock_df)
+    from dividend_etf_core import is_trade_day
+    assert is_trade_day("20260405", config={"token": "t", "api_url": "u", "feishu_url": "f"}) is False
