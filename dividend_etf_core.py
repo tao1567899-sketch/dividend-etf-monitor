@@ -261,3 +261,154 @@ def generate_signal(rsi: float, yield_pct: float) -> str:
         return "BUY"
 
     return "HOLD"
+
+
+# ─────────────────────────────────────────────
+# 历史数据获取辅助函数
+# ─────────────────────────────────────────────
+
+def fetch_8year_daily(ts_code: str, config: dict) -> pd.DataFrame:
+    """获取单只 ETF 近8年日线数据"""
+    end_date = datetime.today().strftime("%Y%m%d")
+    start_date = (datetime.today() - timedelta(days=365 * 8 + 30)).strftime("%Y%m%d")
+    try:
+        df = tushare_call(
+            "fund_daily",
+            params={"ts_code": ts_code, "start_date": start_date, "end_date": end_date},
+            fields="ts_code,trade_date,close,amount",
+            config=config,
+        )
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        return df.dropna(subset=["close"]).sort_values("trade_date").reset_index(drop=True)
+    except Exception as e:
+        logger.warning(f"获取 {ts_code} 日线数据失败：{e}")
+        return pd.DataFrame()
+
+
+def fetch_12month_div(ts_code: str, config: dict) -> pd.DataFrame:
+    """获取单只 ETF 近14个月分红数据（多2个月缓冲）"""
+    end_date = datetime.today().strftime("%Y%m%d")
+    start_date = (datetime.today() - timedelta(days=365 + 60)).strftime("%Y%m%d")
+    try:
+        df = tushare_call(
+            "fund_div",
+            params={"ts_code": ts_code, "start_date": start_date, "end_date": end_date},
+            fields="ts_code,ex_date,div_cash",
+            config=config,
+        )
+        df["div_cash"] = pd.to_numeric(df["div_cash"], errors="coerce").fillna(0)
+        return df
+    except Exception as e:
+        logger.warning(f"获取 {ts_code} 分红数据失败：{e}")
+        return pd.DataFrame(columns=["ts_code", "ex_date", "div_cash"])
+
+
+# ─────────────────────────────────────────────
+# 8 年历史回测
+# ─────────────────────────────────────────────
+
+STOP_LOSS_RATIO = 0.85   # 买入成本的 85%（-15% 止损）
+INITIAL_CAPITAL = 20_000
+
+
+def run_backtest(
+    ts_code: str,
+    daily_df: pd.DataFrame,
+    div_df: pd.DataFrame,
+    initial_capital: float = INITIAL_CAPITAL,
+) -> dict:
+    """
+    对单只 ETF 运行历史回测。
+    - daily_df: trade_date(YYYYMMDD), close
+    - div_df: ts_code, ex_date(YYYYMMDD), div_cash
+    返回 dict: annualized_return, max_drawdown, total_trades, win_rate
+    """
+    df = daily_df.copy().sort_values("trade_date").reset_index(drop=True)
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df = df.dropna(subset=["close"])
+
+    if len(df) < 100:
+        return {"annualized_return": 0.0, "max_drawdown": 0.0, "total_trades": 0, "win_rate": 0.0}
+
+    capital = float(initial_capital)
+    position = 0        # 持有份数
+    buy_price = 0.0
+    trades = []
+    portfolio_values = []
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+        current_price = float(row["close"])
+        current_date = str(row["trade_date"])
+
+        # 当前持仓市值
+        portfolio_values.append(capital + position * current_price)
+
+        # ─── 已持仓：检查卖出条件 ───
+        if position > 0:
+            stop_price = buy_price * STOP_LOSS_RATIO
+            yield_pct = calculate_ttm_yield(ts_code, current_price, div_df)
+            rsi = calculate_weekly_rsi(df.iloc[: i + 1])
+            rsi_val = rsi if rsi is not None else 50.0
+
+            sell_reason = None
+            if current_price <= stop_price:
+                sell_reason = "STOP_LOSS"
+            elif rsi_val >= RSI_SELL_THRESHOLD:
+                sell_reason = "SELL_RSI"
+            elif 0 < yield_pct <= YIELD_SELL_THRESHOLD:
+                sell_reason = "SELL_YIELD"
+
+            if sell_reason:
+                proceeds = position * current_price
+                profit_pct = (current_price - buy_price) / buy_price * 100
+                capital = proceeds
+                trades.append({"date": current_date, "profit_pct": profit_pct, "reason": sell_reason})
+                position = 0
+                buy_price = 0.0
+
+        # ─── 空仓：检查买入条件 ───
+        elif position == 0:
+            rsi = calculate_weekly_rsi(df.iloc[: i + 1])
+            if rsi is None:
+                continue
+            yield_pct = calculate_ttm_yield(ts_code, current_price, div_df)
+
+            if rsi <= RSI_BUY_THRESHOLD and yield_pct >= YIELD_BUY_THRESHOLD:
+                shares = int(capital / current_price / 100) * 100  # 按100份整手买入
+                if shares > 0:
+                    position = shares
+                    buy_price = current_price
+                    capital -= shares * current_price
+
+    # 收尾：强制平仓
+    if position > 0:
+        last_price = float(df.iloc[-1]["close"])
+        profit_pct = (last_price - buy_price) / buy_price * 100
+        capital += position * last_price
+        trades.append({"date": str(df.iloc[-1]["trade_date"]), "profit_pct": profit_pct, "reason": "END"})
+
+    # ─── 计算指标 ───
+    total_return = (capital - initial_capital) / initial_capital
+    start_dt = pd.to_datetime(df.iloc[0]["trade_date"], format="%Y%m%d")
+    end_dt = pd.to_datetime(df.iloc[-1]["trade_date"], format="%Y%m%d")
+    years = max((end_dt - start_dt).days / 365.25, 0.01)
+    annualized_return = ((1 + total_return) ** (1 / years) - 1) * 100
+
+    # 最大回撤
+    pv = pd.Series(portfolio_values, dtype=float)
+    rolling_max = pv.expanding().max()
+    drawdowns = (pv - rolling_max) / rolling_max * 100
+    max_drawdown = float(drawdowns.min())
+
+    # 胜率（排除 END 平仓）
+    closed_trades = [t for t in trades if t["reason"] != "END"]
+    win_trades = [t for t in closed_trades if t["profit_pct"] > 0]
+    win_rate = len(win_trades) / len(closed_trades) * 100 if closed_trades else 0.0
+
+    return {
+        "annualized_return": round(annualized_return, 2),
+        "max_drawdown": round(max_drawdown, 2),
+        "total_trades": len(closed_trades),
+        "win_rate": round(win_rate, 2),
+    }
