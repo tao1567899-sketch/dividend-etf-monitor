@@ -100,7 +100,8 @@ def is_trade_day(date_str: str, config: dict) -> bool:
 
 DIVIDEND_KEYWORDS = ["红利", "股息", "高息", "红利低波", "央企红利"]
 MIN_LIST_MONTHS = 6
-MIN_AVG_AMOUNT = 500_000  # 测试数据单位一致：日均成交额阈值
+# fund_daily amount 单位：千元。500万元 = 5000千元
+MIN_AVG_AMOUNT = 5_000
 
 
 def screen_dividend_etfs(config: dict) -> pd.DataFrame:
@@ -147,9 +148,12 @@ def screen_dividend_etfs(config: dict) -> pd.DataFrame:
         return df
 
     daily_df["amount"] = pd.to_numeric(daily_df["amount"], errors="coerce").fillna(0)
+    daily_df = daily_df.copy()
+    daily_df["trade_date"] = pd.to_datetime(daily_df["trade_date"], format="%Y%m%d")
     avg_amount = (
-        daily_df.groupby("ts_code")["amount"]
-        .apply(lambda x: x.nlargest(20).mean())
+        daily_df.sort_values("trade_date")
+        .groupby("ts_code")["amount"]
+        .apply(lambda x: x.iloc[-20:].mean() if len(x) >= 20 else x.mean())
         .reset_index()
         .rename(columns={"amount": "avg_amount"})
     )
@@ -181,6 +185,9 @@ def calculate_weekly_rsi(daily_df: pd.DataFrame, period: int = 14):
 
     # 日线 → 周线（每周最后交易日收盘价）
     weekly_close = df["close"].resample("W").last().dropna()
+    # Drop current incomplete week: only keep weeks that ended before today
+    today = pd.Timestamp.today().normalize()
+    weekly_close = weekly_close[weekly_close.index < today]
 
     if len(weekly_close) < period + 1:
         return None
@@ -303,6 +310,24 @@ def fetch_12month_div(ts_code: str, config: dict) -> pd.DataFrame:
         return pd.DataFrame(columns=["ts_code", "ex_date", "div_cash"])
 
 
+def fetch_8year_div(ts_code: str, config: dict) -> pd.DataFrame:
+    """获取单只 ETF 近8年分红数据（供回测使用）"""
+    end_date = datetime.today().strftime("%Y%m%d")
+    start_date = (datetime.today() - timedelta(days=365 * 8 + 30)).strftime("%Y%m%d")
+    try:
+        df = tushare_call(
+            "fund_div",
+            params={"ts_code": ts_code, "start_date": start_date, "end_date": end_date},
+            fields="ts_code,ex_date,div_cash",
+            config=config,
+        )
+        df["div_cash"] = pd.to_numeric(df["div_cash"], errors="coerce").fillna(0)
+        return df
+    except Exception as e:
+        logger.warning(f"获取 {ts_code} 8年分红数据失败：{e}")
+        return pd.DataFrame(columns=["ts_code", "ex_date", "div_cash"])
+
+
 # ─────────────────────────────────────────────
 # 8 年历史回测
 # ─────────────────────────────────────────────
@@ -336,6 +361,36 @@ def run_backtest(
     trades = []
     portfolio_values = []
 
+    # ─── 预计算周线 RSI 系列（避免 O(n²)）───
+    df_for_rsi = df.copy()
+    df_for_rsi["trade_date_dt"] = pd.to_datetime(df_for_rsi["trade_date"], format="%Y%m%d")
+    df_for_rsi = df_for_rsi.set_index("trade_date_dt")
+    weekly_close = df_for_rsi["close"].resample("W").last().dropna()
+    today = pd.Timestamp.today().normalize()
+    weekly_close = weekly_close[weekly_close.index < today]
+
+    if len(weekly_close) >= 15:
+        delta = weekly_close.diff().dropna()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+        avg_loss_safe = avg_loss.replace(0, np.nan)
+        rs = avg_gain / avg_loss_safe
+        rsi_series = (100 - (100 / (1 + rs))).dropna()
+        rsi_index = rsi_series.index.tolist()
+        rsi_map = {week_end: rsi_val for week_end, rsi_val in zip(rsi_index, rsi_series.values.tolist())}
+
+        def get_rsi_for_date(trade_date_str):
+            dt = pd.to_datetime(trade_date_str, format="%Y%m%d")
+            past_weeks = [w for w in rsi_index if w <= dt]
+            if not past_weeks:
+                return None
+            return rsi_map[past_weeks[-1]]
+    else:
+        def get_rsi_for_date(trade_date_str):
+            return None
+
     for i in range(len(df)):
         row = df.iloc[i]
         current_price = float(row["close"])
@@ -348,7 +403,7 @@ def run_backtest(
         if position > 0:
             stop_price = buy_price * STOP_LOSS_RATIO
             yield_pct = calculate_ttm_yield(ts_code, current_price, div_df)
-            rsi = calculate_weekly_rsi(df.iloc[: i + 1])
+            rsi = get_rsi_for_date(current_date)
             rsi_val = rsi if rsi is not None else 50.0
 
             sell_reason = None
@@ -369,7 +424,7 @@ def run_backtest(
 
         # ─── 空仓：检查买入条件 ───
         elif position == 0:
-            rsi = calculate_weekly_rsi(df.iloc[: i + 1])
+            rsi = get_rsi_for_date(current_date)
             if rsi is None:
                 continue
             yield_pct = calculate_ttm_yield(ts_code, current_price, div_df)
@@ -472,7 +527,8 @@ def main():
             # 7. 回测（仅买入标的计算回测）
             backtest_result = {"annualized_return": 0.0, "max_drawdown": 0.0, "total_trades": 0, "win_rate": 0.0}
             if signal == "BUY":
-                backtest_result = run_backtest(ts_code, daily_df, div_df)
+                backtest_div_df = fetch_8year_div(ts_code, config)
+                backtest_result = run_backtest(ts_code, daily_df, backtest_div_df)
 
             etf_result = {
                 "ts_code": ts_code,

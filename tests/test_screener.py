@@ -25,11 +25,11 @@ def _make_fund_basic():
 
 
 def _make_fund_daily_liquid():
-    """20日成交额数据：512890 和 159905 满足500万，512810 不满足"""
+    """20日成交额数据（单位：千元）：512890 和 159905 满足500万（5000千元），512810 不满足"""
     records = []
-    for code, amt in [("512890.SH", 8000000), ("159905.SZ", 6000000), ("512810.SH", 3000000)]:
+    for code, amt in [("512890.SH", 6000), ("159905.SZ", 5500), ("512810.SH", 3000)]:
         for i in range(20):
-            records.append({"ts_code": code, "trade_date": f"202604{i+1:02d}", "amount": amt / 10})
+            records.append({"ts_code": code, "trade_date": f"202604{i+1:02d}", "amount": amt})
     return pd.DataFrame(records)
 
 
