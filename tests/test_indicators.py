@@ -50,3 +50,35 @@ def test_is_trade_day_false(mocker):
     mocker.patch("dividend_etf_core.tushare_call", return_value=mock_df)
     from dividend_etf_core import is_trade_day
     assert is_trade_day("20260405", config={"token": "t", "api_url": "u", "feishu_url": "f"}) is False
+
+
+def test_calculate_weekly_rsi_known_value():
+    """
+    持续上涨序列 RSI 应 > 90；持续下跌序列 RSI 应 < 10。
+    """
+    from dividend_etf_core import calculate_weekly_rsi
+
+    # 持续上涨：RSI 应接近 100
+    dates = pd.date_range("2020-01-01", periods=200, freq="B")
+    prices = pd.Series(range(1, 201), index=dates, dtype=float)
+    df_up = pd.DataFrame({"trade_date": dates.strftime("%Y%m%d"), "close": prices.values})
+    rsi_up = calculate_weekly_rsi(df_up)
+    assert rsi_up is not None
+    assert rsi_up > 90, f"持续上涨序列 RSI 应>90，实际={rsi_up:.2f}"
+
+    # 持续下跌：RSI 应接近 0
+    prices_down = pd.Series(range(200, 0, -1), index=dates, dtype=float)
+    df_down = pd.DataFrame({"trade_date": dates.strftime("%Y%m%d"), "close": prices_down.values})
+    rsi_down = calculate_weekly_rsi(df_down)
+    assert rsi_down is not None
+    assert rsi_down < 10, f"持续下跌序列 RSI 应<10，实际={rsi_down:.2f}"
+
+
+def test_calculate_weekly_rsi_insufficient_data():
+    """数据不足14周时返回 None"""
+    from dividend_etf_core import calculate_weekly_rsi
+
+    dates = pd.date_range("2024-01-01", periods=30, freq="B")
+    prices = pd.Series(range(1, 31), index=dates, dtype=float)
+    df = pd.DataFrame({"trade_date": dates.strftime("%Y%m%d"), "close": prices.values})
+    assert calculate_weekly_rsi(df) is None

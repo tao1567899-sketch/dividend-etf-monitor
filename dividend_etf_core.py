@@ -160,3 +160,43 @@ def screen_dividend_etfs(config: dict) -> pd.DataFrame:
 
     logger.info(f"筛选后红利ETF共 {len(df)} 只")
     return df[["ts_code", "name"]].reset_index(drop=True)
+
+
+# ─────────────────────────────────────────────
+# 周线 RSI(14) 计算
+# ─────────────────────────────────────────────
+
+def calculate_weekly_rsi(daily_df: pd.DataFrame, period: int = 14):
+    """
+    从日线数据计算周线 RSI(14)。
+    - daily_df 需包含 'trade_date'(YYYYMMDD str) 和 'close' 列
+    - 以每周最后一个交易日收盘价构建周线序列
+    - 使用 Wilder 平滑（EWM alpha=1/period）
+    - 数据不足 period+1 根周线时返回 None
+    """
+    df = daily_df.copy()
+    df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d")
+    df = df.sort_values("trade_date").set_index("trade_date")
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+
+    # 日线 → 周线（每周最后交易日收盘价）
+    weekly_close = df["close"].resample("W").last().dropna()
+
+    if len(weekly_close) < period + 1:
+        return None
+
+    delta = weekly_close.diff().dropna()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+    # 避免除零：avg_loss 为 0 时 RSI = 100（纯上涨）；avg_gain 为 0 时 RSI = 0（纯下跌）
+    avg_loss_abs = avg_loss.abs()
+    avg_gain_abs = avg_gain.abs()
+    rs = np.where(avg_loss_abs == 0, np.inf, avg_gain_abs / avg_loss_abs)
+    rsi = pd.Series(100 - (100 / (1 + rs)), index=avg_gain.index)
+
+    last_rsi = rsi.iloc[-1]
+    return round(float(last_rsi), 2) if not np.isnan(last_rsi) else None
